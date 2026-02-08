@@ -58,23 +58,47 @@ system_prompt = """# 关于你
 # 你的行为准则
 - 你通过调用工具来与用户交流和执行动作。
 - 在每次决策时，你必须选择一个工具来执行。
-- 如果你想回复用户，使用 send_text。
-- 如果当前不需要回复，但对话还在进行中，使用 pass_and_wait 等待用户的下一条消息。
-- 如果对话已经自然结束，或者你认为本轮对话可以告一段落，或者你暂时不想继续对话，使用 stop_conversation 结束这轮对话。
-- 你可以在一次决策中调用多个 send_text，例如先发一段话，再发另一段话。
 - 保持你的人设和表达风格，用符合你性格的方式回复。
+- 后续的消息都遵循 "【时间】发送者：消息内容" 的格式。这个格式时给你看的，不需要你回复给用户。
+- 你的回复必须有理有据，禁止无根据地编造信息或胡乱回复。如果你不确定如何回复，可以跟风或转移话题，但是前提是足够自然不机械。
 
 警告：直接输出文本而不调用 send_text 是不允许的。如果你想回复用户，必须使用 send_text 工具。
+"""
+
+sub_agent_system_prompt = """你是一个聊天意图识别助手。
+你的任务是分析新收到的聊天消息，结合历史上下文，判断主机器人是否有必要进行响应。
+
+# 判定准则
+你应该在以下情况判定为 "需要回复" (should_respond = true)：
+1. 明确提及：消息中明确提到了机器人的名字({nickname})或代称。
+2. 话题相关：消息内容与当前正在进行的话题高度相关，需要机器人进一步说明、回答或参与。
+3. 话语完整：对方的话已经说完，或者是一个完整的问题/指令。
+4. 情感互动：对方在表达某种需要回应的情绪（如问候、告别、称赞、抱怨等）。
+
+你应该在以下情况判定为 "不需要回复" (should_respond = false)：
+1. 话题无关：消息是群聊中的闲聊，且机器人并非话题参与者。
+2. 话未说完：明显是一连串消息中的中间部分，可以继续等待后续。
+3. 机器博弈：检测到是其他 Bot 的自动回复或无意义的刷屏消息。
+4. 纯粹表情：只有单个表情且不携带任何需要回复的语义。
+
+# 输出格式
+请务必返回 JSON 格式，如下所示：
+```json
+{{
+    "reason": "简短的判定理由",
+    "should_respond": true/false
+}}
+```
 """
 
 # ─── Actions ────────────────────────────────────────────────
 
 
 class SendTextAction(BaseAction):
-    """发送文本消息的 Action"""
+    """发送文本消息"""
 
     action_name = "send_text"
-    action_description = "发送一段文本消息给用户"
+    action_description = "发送一段文本消息给用户，这是你回复用户的主要方式。你可以调用多次 send_text 来分多段回复，但每次调用必须提供你想说的话的文本内容，不要添加任何标记或格式，只写纯文本即可。注意：本工具无法发送表情包等非文本内容。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
@@ -89,10 +113,10 @@ class SendTextAction(BaseAction):
 
 
 class PassAndWaitAction(BaseAction):
-    """跳过本次动作，等待新消息的 Action"""
+    """跳过本次动作，等待新消息"""
 
     action_name = "pass_and_wait"
-    action_description = "跳过本次动作，不进行任何操作，但保持对话继续，等待用户新消息"
+    action_description = "跳过本次动作，不进行任何操作，但保持对话继续，等待用户新消息。若当前不需要回复，但对话还在进行中，使用本工具等待用户的下一条消息。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
@@ -102,10 +126,10 @@ class PassAndWaitAction(BaseAction):
 
 
 class StopConversationAction(BaseAction):
-    """结束当前对话轮次的 Action"""
+    """结束当前对话轮次"""
 
     action_name = "stop_conversation"
-    action_description = "结束当前对话轮次，过一段时间后再允许开启新对话"
+    action_description = "结束当前对话，过一段时间后再允许开启新对话。如果对话已经自然结束，或者你认为本轮对话可以告一段落，或者你暂时不想继续对话，使用本工具结束这轮对话。"
 
     chatter_allow: list[str] = ["default_chatter"]
 
@@ -143,17 +167,83 @@ class DefaultChatter(BaseChatter):
 
     dependencies: list[str] = []
 
-    async def sub_agent(self, unreads_text: str) -> dict:
-        """子代理逻辑，处理未读消息文本并返回结果
-
+    async def sub_agent(self, unreads_text: str, payloads: list[LLMPayload]) -> dict:
+        """子代理决策：判断是否需要响应用新消息。
+        
         Args:
-            unreads_text: 当前未读消息的文本内容
-
+            unreads_text: 格式化后的未读消息
+            payloads: 当前主代理的上下文 payloads 副本
+            
         Returns:
-            dict: 处理结果，可以包含需要传递给 LLM 的信息
+            dict: 包含 should_respond (bool) 和 reason (str)
         """
-        # 这里可以添加对未读消息的预处理逻辑，例如提取关键信息、进行情感分析等
-        return {"processed_unreads": unreads_text}
+        # 1. 获取模型配置
+        try:
+            model_set = get_model_set_by_task("sub_actor")
+        except Exception:
+            # 回退到 actor 模型
+            model_set = get_model_set_by_task("actor")
+            
+        if not model_set:
+            return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
+
+        # 2. 构建子代理请求
+        # 共享上下文：排除掉主代理的 SYSTEM 提示词，注入子代理的
+        sub_payloads = []
+        
+        # 注入子代理系统提示词
+        nickname = get_core_config().personality.nickname
+        tmpl = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
+        if tmpl:
+            sub_prompt = tmpl.set("nickname", nickname).build()
+        else:
+            sub_prompt = sub_agent_system_prompt.format(nickname=nickname)
+        sub_payloads.append(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
+        
+        # 过滤掉原有的 SYSTEM 和 TOOL 相关消息，子代理不需要工具定义
+        # 只保留对话历史 (USER/ASSISTANT)，防止子代理产生 tool call
+        for p in payloads:
+            if p.role not in (ROLE.SYSTEM, ROLE.TOOL, ROLE.TOOL_RESULT):
+                sub_payloads.append(p)
+                
+        # 追加最新的未读消息作为判定的对象
+        sub_payloads.append(LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}")))
+        
+        request = create_llm_request(model_set, "sub_agent")
+        for p in sub_payloads:
+            request.add_payload(p)
+            
+        # 3. 执行请求
+        try:
+            response = await request.send(stream=False)
+            await response
+            
+            content = response.message
+            if not content or not content.strip():
+                logger.warning("Sub-agent 返回了空内容，默认进行响应")
+                return {"should_respond": True, "reason": "模型未返回判断内容"}
+
+            # 4. 解析 JSON
+            import json_repair
+            
+            # 使用 json_repair.loads 直接尝试解析（它会自动处理 markdown 块和修复）
+            try:
+                result = json_repair.loads(content)
+                
+                if isinstance(result, dict):
+                    return {
+                        "should_respond": bool(result.get("should_respond", True)),
+                        "reason": result.get("reason", "未提供理由")
+                    }
+
+            except Exception as e:
+                logger.debug(f"Sub-agent JSON 解析失败: {e} | 内容: {content[:500]}")
+
+            logger.warning(f"Sub-agent 无法找到有效的 JSON 结构: {content[:200]}...")
+            return {"should_respond": True, "reason": "解析 JSON 失败，默认响应"}
+        except Exception as e:
+            logger.error(f"Sub-agent 决策过程异常: {e}", exc_info=True)
+            return {"should_respond": True, "reason": f"执行异常: {e}"}
     
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """执行聊天器的对话循环。
@@ -195,7 +285,8 @@ class DefaultChatter(BaseChatter):
         )
 
         # 系统提示（动态构建）
-        system_prompt = get_prompt_manager().get_template("default_chatter_system_prompt").build()
+        tmpl = get_prompt_manager().get_template("default_chatter_system_prompt")
+        system_prompt = tmpl.build() if tmpl else ""
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
        
         # 历史消息（来自 stream context，构成对话背景）
@@ -204,7 +295,7 @@ class DefaultChatter(BaseChatter):
             history_lines.append(
                 f"【{msg.time}】{msg.sender_name}: {msg.processed_plain_text}"
             )
-        history_text = "\n".join(history_lines)
+        history_text = "以下为最近的聊天历史记录：\n" + "\n".join(history_lines)
         if history_text:
             request.add_payload(LLMPayload(ROLE.USER, Text(history_text)))
         
@@ -227,8 +318,17 @@ class DefaultChatter(BaseChatter):
             unreads = unread_msgs
 
             if formatted_text:
-                # 将未读消息组作为一个USER payload
+                # ── 子代理决策 ──
+                decision = await self.sub_agent(formatted_text, response.payloads)
+                logger.info(f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})")
+                
+                # 无论是否响应，都将消息作为 USER payload 追加到主上下文中
                 response.add_payload(LLMPayload(ROLE.USER, Text(formatted_text)))
+                
+                if not decision["should_respond"]:
+                    logger.info("Sub-agent 决定不响应，继续等待...")
+                    yield Wait()
+                    continue
             else:
                 yield Wait()
                 continue
@@ -370,6 +470,14 @@ class DefaultChatterPlugin(BasePlugin):
             }   
         )
     
+        get_prompt_manager().get_or_create(
+            name="default_chatter_sub_agent_prompt",
+            template=sub_agent_system_prompt,
+            policies={
+                "nickname": optional(personality.nickname),
+            }
+        )
+
     def get_components(self) -> list[type]:
         """获取插件内所有组件类
 

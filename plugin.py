@@ -178,12 +178,8 @@ class DefaultChatter(BaseChatter):
             dict: 包含 should_respond (bool) 和 reason (str)
         """
         # 1. 获取模型配置
-        try:
-            model_set = get_model_set_by_task("sub_actor")
-        except Exception:
-            # 回退到 actor 模型
-            model_set = get_model_set_by_task("actor")
-            
+        model_set = get_model_set_by_task("sub_actor")
+     
         if not model_set:
             return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
 

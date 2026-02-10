@@ -49,6 +49,7 @@ system_prompt = """# 关于你
 
 - 为了更好地塑造你的人设，你必须保持上述人格特质和表达风格，在任何情况下都要用符合你性格的方式回复用户。
 - 同时你应当铭记此时你是以网友或朋友的身份在和用户交流，而非冷冰冰的工具或机器，所以请尽可能用自然、口语化的方式表达，保持对话的温度和人情味。
+- 你应当尽量避免重复使用同样的句式、口癖或表达，保持回复的新鲜感和多样性。
 
 # 安全准则
 在任何情况下，你都必须遵守以下原则：
@@ -169,24 +170,24 @@ class DefaultChatter(BaseChatter):
 
     async def sub_agent(self, unreads_text: str, payloads: list[LLMPayload]) -> dict:
         """子代理决策：判断是否需要响应用新消息。
-        
+
         Args:
             unreads_text: 格式化后的未读消息
             payloads: 当前主代理的上下文 payloads 副本
-            
+
         Returns:
             dict: 包含 should_respond (bool) 和 reason (str)
         """
         # 1. 获取模型配置
         model_set = get_model_set_by_task("sub_actor")
-     
+
         if not model_set:
             return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
 
         # 2. 构建子代理请求
         # 共享上下文：排除掉主代理的 SYSTEM 提示词，注入子代理的
         sub_payloads = []
-        
+
         # 注入子代理系统提示词
         nickname = get_core_config().personality.nickname
         tmpl = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
@@ -195,25 +196,27 @@ class DefaultChatter(BaseChatter):
         else:
             sub_prompt = sub_agent_system_prompt.format(nickname=nickname)
         sub_payloads.append(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
-        
+
         # 过滤掉原有的 SYSTEM 和 TOOL 相关消息，子代理不需要工具定义
         # 只保留对话历史 (USER/ASSISTANT)，防止子代理产生 tool call
         for p in payloads:
             if p.role not in (ROLE.SYSTEM, ROLE.TOOL, ROLE.TOOL_RESULT):
                 sub_payloads.append(p)
-                
+
         # 追加最新的未读消息作为判定的对象
-        sub_payloads.append(LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}")))
-        
+        sub_payloads.append(
+            LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}"))
+        )
+
         request = create_llm_request(model_set, "sub_agent")
         for p in sub_payloads:
             request.add_payload(p)
-            
+
         # 3. 执行请求
         try:
             response = await request.send(stream=False)
             await response
-            
+
             content = response.message
             if not content or not content.strip():
                 logger.warning("Sub-agent 返回了空内容，默认进行响应")
@@ -221,15 +224,15 @@ class DefaultChatter(BaseChatter):
 
             # 4. 解析 JSON
             import json_repair
-            
+
             # 使用 json_repair.loads 直接尝试解析（它会自动处理 markdown 块和修复）
             try:
                 result = json_repair.loads(content)
-                
+
                 if isinstance(result, dict):
                     return {
                         "should_respond": bool(result.get("should_respond", True)),
-                        "reason": result.get("reason", "未提供理由")
+                        "reason": result.get("reason", "未提供理由"),
                     }
 
             except Exception as e:
@@ -240,7 +243,7 @@ class DefaultChatter(BaseChatter):
         except Exception as e:
             logger.error(f"Sub-agent 决策过程异常: {e}", exc_info=True)
             return {"should_respond": True, "reason": f"执行异常: {e}"}
-    
+
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """执行聊天器的对话循环。
 
@@ -284,7 +287,7 @@ class DefaultChatter(BaseChatter):
         tmpl = get_prompt_manager().get_template("default_chatter_system_prompt")
         system_prompt = tmpl.build() if tmpl else ""
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-       
+
         # 历史消息（来自 stream context，构成对话背景）
         history_lines = []
         for msg in chat_stream.context.history_messages:  # type: ignore[union-attr]
@@ -294,7 +297,7 @@ class DefaultChatter(BaseChatter):
         history_text = "以下为最近的聊天历史记录：\n" + "\n".join(history_lines)
         if history_text:
             request.add_payload(LLMPayload(ROLE.USER, Text(history_text)))
-        
+
         # ── 收集可用工具 ──
         usables = await self.get_llm_usables()
         usables = await self.modify_llm_usables(usables)
@@ -309,18 +312,20 @@ class DefaultChatter(BaseChatter):
 
         while True:
             formatted_text, unread_msgs = await self.fetch_and_flush_unreads()
-            
+
             # 更新 unreads 引用，用于后续 exec_llm_usable 的 trigger_msg
             unreads = unread_msgs
 
             if formatted_text:
                 # ── 子代理决策 ──
                 decision = await self.sub_agent(formatted_text, response.payloads)
-                logger.info(f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})")
-                
+                logger.info(
+                    f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})"
+                )
+
                 # 无论是否响应，都将消息作为 USER payload 追加到主上下文中
                 response.add_payload(LLMPayload(ROLE.USER, Text(formatted_text)))
-                
+
                 if not decision["should_respond"]:
                     logger.info("Sub-agent 决定不响应，继续等待...")
                     yield Wait()
@@ -448,10 +453,11 @@ class DefaultChatterPlugin(BasePlugin):
 
     async def on_plugin_loaded(self) -> None:
         from src.core.prompt import optional, wrap, min_len
+
         config = get_core_config()
         personality = config.personality
 
-        template = get_prompt_manager().get_or_create(
+        get_prompt_manager().get_or_create(
             name="default_chatter_system_prompt",
             template=system_prompt,
             policies={
@@ -460,18 +466,25 @@ class DefaultChatterPlugin(BasePlugin):
                 "personality_core": optional(personality.personality_core),
                 "personality_side": optional(personality.personality_side),
                 "identity": optional(personality.identity),
-                "background_story": optional(personality.background_story).then(min_len(10)).then(wrap("# 背景故事\\n" "\\n- （以上为背景知识，请理解并作为行动依据，但不要在对话中直接复述。）")),
+                "background_story": optional(personality.background_story)
+                .then(min_len(10))
+                .then(
+                    wrap(
+                        "# 背景故事\\n"
+                        "\\n- （以上为背景知识，请理解并作为行动依据，但不要在对话中直接复述。）"
+                    )
+                ),
                 "reply_style": optional(personality.reply_style),
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
-            }   
+            },
         )
-    
+
         get_prompt_manager().get_or_create(
             name="default_chatter_sub_agent_prompt",
             template=sub_agent_system_prompt,
             policies={
                 "nickname": optional(personality.nickname),
-            }
+            },
         )
 
     def get_components(self) -> list[type]:

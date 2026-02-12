@@ -365,7 +365,7 @@ class DefaultChatter(BaseChatter):
             should_stop = False
             stop_minutes = 0.0
 
-            for call in response.call_list:
+            for call in (response.call_list or []):
                 args = call.args if isinstance(call.args, dict) else {}
                 reason = args.pop("reason", "未提供原因")
                 logger.info(f"LLM 调用 {call.name}，原因: {reason}，参数: {args}")

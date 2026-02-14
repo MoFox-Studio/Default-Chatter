@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import AsyncGenerator
 
 from src.core.components.types import ChatType
@@ -60,6 +61,8 @@ system_prompt = """# 关于你
 - 保持你的人设和表达风格，用符合你性格的方式回复。
 - 后续的消息都遵循 json 的标准化格式。这个格式是给你看的，请不要模仿其格式与用户对话。
 - 你的回复必须有理有据，禁止无根据地编造信息或胡乱回复。如果你不确定如何回复，可以跟风或转移话题，但是前提是足够自然不机械。
+
+当前时间: {current_time}
 """
 
 sub_agent_system_prompt = """你是一个聊天意图识别助手。
@@ -481,6 +484,7 @@ class DefaultChatterPlugin(BasePlugin):
                 ),
                 "reply_style": optional(personality.reply_style),
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
+                "current_time": optional(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             },
         )
 

@@ -178,20 +178,28 @@ class DefaultChatter(BaseChatter):
 
     @staticmethod
     def _format_hms(raw_time: Any) -> str:
-        """将任意时间值格式化为 hh:mm:ss。"""
+        """将任意时间值格式化为 HH:MM。"""
         text = str(raw_time or "").strip()
         if not text:
-            return "00:00:00"
+            return "00:00"
+
+        try:
+            timestamp = float(text)
+            if timestamp > 0:
+                dt = datetime.datetime.fromtimestamp(timestamp)
+                return dt.strftime("%H:%M")
+        except Exception:
+            pass
 
         if " " in text:
             text = text.split(" ")[-1]
 
-        if len(text) >= 8 and text[2] == ":" and text[5] == ":":
-            return text[:8]
+        if len(text) >= 5 and text[2] == ":":
+            return text[:5]
 
         try:
             dt = datetime.datetime.fromisoformat(str(raw_time))
-            return dt.strftime("%H:%M:%S")
+            return dt.strftime("%H:%M")
         except Exception:
             return text
 

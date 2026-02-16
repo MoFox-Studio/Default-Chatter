@@ -33,6 +33,7 @@ from src.core.components.loader import register_plugin
 from src.core.config import get_core_config
 from src.core.prompt import get_prompt_manager
 from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text, ToolResult
+from src.core.models.stream import ChatStream
 from .config import DefaultChatterConfig
 
 logger = get_logger("default_chatter")
@@ -64,6 +65,12 @@ system_prompt = """# 关于你
 - 你的回复必须有理有据，禁止无根据地编造信息或胡乱回复。如果你不确定如何回复，可以跟风或转移话题，但是前提是足够自然不机械。
 
 当前时间: {current_time}
+
+# 其他信息
+你目前正在聊天的平台是：{platform}，聊天类型是 {chat_type}。
+在该平台你的信息：
+- 昵称：{nickname}
+- id：{bot_id}
 """
 
 sub_agent_system_prompt = """你是一个聊天意图识别助手。
@@ -204,12 +211,22 @@ class DefaultChatter(BaseChatter):
             return text
 
     @staticmethod
-    def _build_system_prompt() -> str:
+    def _build_system_prompt(chat_stream: ChatStream) -> str:
         """构建系统提示词。"""
         tmpl = get_prompt_manager().get_template("default_chatter_system_prompt")
-        return tmpl.build() if tmpl else ""
+        return (
+            tmpl.set("platform", chat_stream.platform)
+            .set("chat_type", chat_stream.chat_type)
+            .set("nickname", chat_stream.bot_nickname)
+            .set("bot_id", chat_stream.bot_id)
+            .build()
+            if tmpl
+            else ""
+        )
 
-    def _build_classical_user_text(self, chat_stream: Any, unread_msgs: list[Any]) -> str:
+    def _build_classical_user_text(
+        self, chat_stream: Any, unread_msgs: list[Any]
+    ) -> str:
         """构建 classical 模式 user 提示词。"""
         history_lines = []
         history_messages = getattr(chat_stream.context, "history_messages", [])
@@ -273,9 +290,7 @@ class DefaultChatter(BaseChatter):
             LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}"))
         )
 
-        context_manager = LLMContextManager(
-            max_payloads=5
-        )
+        context_manager = LLMContextManager(max_payloads=5)
 
         request = create_llm_request(
             model_set,
@@ -343,7 +358,9 @@ class DefaultChatter(BaseChatter):
         async for result in self._execute_enhanced(chat_stream):
             yield result
 
-    async def _execute_enhanced(self, chat_stream: Any) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+    async def _execute_enhanced(
+        self, chat_stream: Any
+    ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """enhanced 模式执行流程（保留原有行为）。"""
 
         # ── 构建 LLM 请求 ──
@@ -371,7 +388,7 @@ class DefaultChatter(BaseChatter):
         )
 
         # 系统提示（动态构建）
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(chat_stream)
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         # 历史消息（来自 stream context，构成对话背景）
@@ -402,7 +419,7 @@ class DefaultChatter(BaseChatter):
             # 更新 unreads 引用，用于后续 exec_llm_usable 的 trigger_msg
             unreads = unread_msgs
 
-            if formatted_text:
+            if formatted_text or unread_msgs:
                 # ── 子代理决策 ──
                 decision = await self.sub_agent(formatted_text, response.payloads)
                 logger.info(
@@ -443,7 +460,7 @@ class DefaultChatter(BaseChatter):
             should_stop = False
             stop_minutes = 0.0
 
-            for call in (response.call_list or []):
+            for call in response.call_list or []:
                 args = call.args if isinstance(call.args, dict) else {}
                 reason = args.pop("reason", "未提供原因")
                 logger.info(f"LLM 调用 {call.name}，原因: {reason}，参数: {args}")
@@ -525,7 +542,9 @@ class DefaultChatter(BaseChatter):
             # 没有特殊控制流，继续让 LLM 决策（LLM 可能连续调用多轮工具）
             continue
 
-    async def _execute_classical(self, chat_stream: Any) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
+    async def _execute_classical(
+        self, chat_stream: Any
+    ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """classical 模式执行流程。"""
         try:
             model_set = get_model_set_by_task("actor")
@@ -549,12 +568,16 @@ class DefaultChatter(BaseChatter):
             formatted_text, unread_msgs = await self.fetch_and_flush_unreads()
             unreads = unread_msgs
 
-            if not formatted_text:
+            if not formatted_text or not unread_msgs:
                 yield Wait()
                 continue
 
-            classical_user_text = self._build_classical_user_text(chat_stream, unread_msgs)
-            decision = await self.sub_agent(classical_user_text, [LLMPayload(ROLE.USER, Text(classical_user_text))])
+            classical_user_text = self._build_classical_user_text(
+                chat_stream, unread_msgs
+            )
+            decision = await self.sub_agent(
+                classical_user_text, [LLMPayload(ROLE.USER, Text(classical_user_text))]
+            )
             logger.info(
                 f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})"
             )
@@ -572,7 +595,9 @@ class DefaultChatter(BaseChatter):
                 "default_chatter",
                 context_manager=context_manager,
             )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt())))
+            request.add_payload(
+                LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(chat_stream)))
+            )
             request.add_payload(LLMPayload(ROLE.USER, Text(classical_user_text)))
             if usable_map.get_all():
                 request.add_payload(LLMPayload(ROLE.TOOL, usable_map.get_all()))  # type: ignore[arg-type]
@@ -602,7 +627,7 @@ class DefaultChatter(BaseChatter):
                 stop_minutes = 0.0
                 sent_once = False
 
-                for call in (response.call_list or []):
+                for call in response.call_list or []:
                     args = call.args if isinstance(call.args, dict) else {}
                     reason = args.pop("reason", "未提供原因")
                     logger.info(f"LLM 调用 {call.name}，原因: {reason}，参数: {args}")
@@ -647,12 +672,16 @@ class DefaultChatter(BaseChatter):
                                 success, result = await self.exec_llm_usable(
                                     usable_cls, trigger_msg, **args  # type: ignore[arg-type]
                                 )
-                                result_text = str(result) if success else f"执行失败: {result}"
+                                result_text = (
+                                    str(result) if success else f"执行失败: {result}"
+                                )
                                 if success and call.name == _SEND_TEXT:
                                     sent_once = True
                             except Exception as e:
                                 result_text = f"执行异常: {e}"
-                                logger.error(f"执行 {call.name} 异常: {e}", exc_info=True)
+                                logger.error(
+                                    f"执行 {call.name} 异常: {e}", exc_info=True
+                                )
 
                         response.add_payload(
                             LLMPayload(
@@ -720,7 +749,9 @@ class DefaultChatterPlugin(BasePlugin):
                 ),
                 "reply_style": optional(personality.reply_style),
                 "safety_guidelines": optional("\n".join(personality.safety_guidelines)),
-                "current_time": optional(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                "current_time": optional(
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ),
             },
         )
 

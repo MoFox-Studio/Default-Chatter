@@ -22,7 +22,7 @@ class DefaultChatterConfig(BaseConfig):
             """不同聊天类型的人设/语气引导。"""
 
             private: str = Field(
-                default="你当前正处于“私下聊天（私聊）”环境中，你可以以更贴近一对一陪伴感的交流方式与用户互动，关注用户情绪并提供更直接、细腻的回应。",
+                default="你当前正处于“私聊”环境中，你可以以更贴近一对一陪伴感的交流方式与用户互动，关注用户情绪并提供更直接、细腻的回应。",
                 description="私聊场景的额外提示词",
             )
             group: str = Field(

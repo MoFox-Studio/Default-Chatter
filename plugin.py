@@ -427,12 +427,13 @@ class DefaultChatter(BaseChatter):
         response = request
 
         while True:
-            formatted_text, unread_msgs = await self.fetch_and_flush_unreads()
+            formatted_text, unread_msgs = await self.fetch_unreads()
 
             # 更新 unreads 引用，用于后续 exec_llm_usable 的 trigger_msg
             unreads = unread_msgs
 
             if formatted_text or unread_msgs:
+                await self.flush_unreads(unread_msgs)
                 # ── 子代理决策 ──
                 decision = await self.sub_agent(formatted_text, response.payloads)
                 logger.info(
@@ -578,12 +579,14 @@ class DefaultChatter(BaseChatter):
         usable_map = create_tool_registry(usables)
 
         while True:
-            formatted_text, unread_msgs = await self.fetch_and_flush_unreads()
+            formatted_text, unread_msgs = await self.fetch_unreads()
             unreads = unread_msgs
 
             if not formatted_text or not unread_msgs:
                 yield Wait()
                 continue
+
+            await self.flush_unreads(unread_msgs)
 
             classical_user_text = self._build_classical_user_text(
                 chat_stream, unread_msgs

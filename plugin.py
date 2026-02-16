@@ -59,6 +59,9 @@ system_prompt = """# 关于你
 {safety_guidelines}
 如果遇到违反上述原则的请求，请在保持你核心人设的同时，以合适的方式进行回应。
 
+# 场景引导
+{theme_guide}
+
 # 你的行为准则
 - 保持你的人设和表达风格，用符合你性格的方式回复。
 - 后续的消息都遵循 json 的标准化格式。这个格式是给你看的，请不要模仿其格式与用户对话。
@@ -210,15 +213,25 @@ class DefaultChatter(BaseChatter):
         except Exception:
             return text
 
-    @staticmethod
-    def _build_system_prompt(chat_stream: ChatStream) -> str:
+    def _build_system_prompt(self, chat_stream: ChatStream) -> str:
         """构建系统提示词。"""
+        selected_theme_guide = ""
+        plugin_config = self.plugin.config
+        if plugin_config and isinstance(plugin_config, DefaultChatterConfig):
+            chat_type_raw = str(chat_stream.chat_type or "").lower()
+
+            if chat_type_raw == ChatType.PRIVATE.value:
+                selected_theme_guide = plugin_config.plugin.theme_guide.private
+            elif chat_type_raw == ChatType.GROUP.value:
+                selected_theme_guide = plugin_config.plugin.theme_guide.group
+
         tmpl = get_prompt_manager().get_template("default_chatter_system_prompt")
         return (
             tmpl.set("platform", chat_stream.platform)
             .set("chat_type", chat_stream.chat_type)
             .set("nickname", chat_stream.bot_nickname)
             .set("bot_id", chat_stream.bot_id)
+            .set("theme_guide", selected_theme_guide)
             .build()
             if tmpl
             else ""

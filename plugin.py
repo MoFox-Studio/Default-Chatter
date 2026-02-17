@@ -433,7 +433,6 @@ class DefaultChatter(BaseChatter):
             unreads = unread_msgs
 
             if formatted_text or unread_msgs:
-                await self.flush_unreads(unread_msgs)
                 # ── 子代理决策 ──
                 decision = await self.sub_agent(formatted_text, response.payloads)
                 logger.info(
@@ -454,6 +453,7 @@ class DefaultChatter(BaseChatter):
             try:
                 response = await response.send(stream=False)
                 await response
+                await self.flush_unreads(unread_msgs)
             except Exception as e:
                 logger.error(f"LLM 请求失败: {e}", exc_info=True)
                 yield Failure("LLM 请求失败", e)
@@ -586,8 +586,6 @@ class DefaultChatter(BaseChatter):
                 yield Wait()
                 continue
 
-            await self.flush_unreads(unread_msgs)
-
             classical_user_text = self._build_classical_user_text(
                 chat_stream, unread_msgs
             )
@@ -624,6 +622,7 @@ class DefaultChatter(BaseChatter):
                 try:
                     response = await response.send(stream=False)
                     await response
+                    await self.flush_unreads(unread_msgs)
                 except Exception as e:
                     logger.error(f"LLM 请求失败: {e}", exc_info=True)
                     yield Failure("LLM 请求失败", e)

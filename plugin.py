@@ -261,7 +261,7 @@ class DefaultChatter(BaseChatter):
         history_block = "\n".join(history_lines) if history_lines else "（无）"
         unread_block = "\n".join(unread_lines) if unread_lines else "（无）"
 
-        return f"# 历史消息\n{history_block}\n\n# 未读消息\n{unread_block}"
+        return f"# 历史消息\n{history_block}\n\n# 未读消息\n{unread_block}\n 注意历史消息只用来了解上下文，你的回复应该基于未读消息来生成，不要复述历史消息中的内容。"
 
     async def sub_agent(self, unreads_text: str, payloads: list[LLMPayload]) -> dict:
         """子代理决策：判断是否需要响应用新消息。
@@ -790,3 +790,4 @@ class DefaultChatterPlugin(BasePlugin):
             PassAndWaitAction,
             StopConversationAction,
         ]
+

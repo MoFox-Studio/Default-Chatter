@@ -571,10 +571,14 @@ class DefaultChatter(BaseChatter):
                 try:
                     response = await response.send(stream=False)
                     await response
-                    await self.flush_unreads(unread_msgs)
+                    # flush_unreads 不在此处调用，避免在 LLM 尚未真正回复用户时
+                    # 就将 unread_msgs 提前写入 history，导致后续重复触发。
+                    # 各终止路径（sent_once / should_stop / should_wait / no-call-list）
+                    # 会在 yield 前分别调用 flush_unreads。
                 except Exception as e:
                     logger.error(f"LLM 请求失败: {e}", exc_info=True)
                     yield Failure("LLM 请求失败", e)
+                    # 请求失败时不 flush，保留 unread_msgs 供外层循环重试
                     break
 
                 if not response.call_list:
@@ -583,6 +587,7 @@ class DefaultChatter(BaseChatter):
                             "LLM 返回了纯文本而非 tool call: "
                             f"{response.message[:100]}"
                         )
+                    await self.flush_unreads(unread_msgs)
                     yield Stop(0)
                     return
 
@@ -628,18 +633,22 @@ class DefaultChatter(BaseChatter):
                         _, success = await self.run_tool_call(call, response, usable_map, trigger_msg)
                         if success and call.name == _SEND_TEXT:
                             sent_once = True
+                            break  # 已发送一次，立即停止处理同批次的后续 tool call
 
                 if sent_once:
                     logger.info("classical 模式已发送一次消息，强制结束当前对话")
+                    await self.flush_unreads(unread_msgs)
                     yield Stop(0)
                     return
 
                 if should_stop:
                     logger.info(f"对话已结束，冷却 {stop_minutes} 分钟")
+                    await self.flush_unreads(unread_msgs)
                     yield Stop(stop_minutes * 60)
                     return
 
                 if should_wait:
+                    await self.flush_unreads(unread_msgs)
                     yield Wait()
                     break
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import datetime
+import json_repair
 from typing import Any, AsyncGenerator
 
 from src.core.components.types import ChatType
@@ -24,15 +25,10 @@ from src.core.components.base import (
     Stop,
 )
 from src.core.components.base.action import BaseAction
-from src.app.plugin_system.api.llm_api import (
-    get_model_set_by_task,
-    create_llm_request,
-    create_tool_registry,
-)
 from src.core.components.loader import register_plugin
 from src.core.config import get_core_config
 from src.core.prompt import get_prompt_manager
-from src.kernel.llm import LLMContextManager, LLMPayload, ROLE, Text, ToolResult
+from src.kernel.llm import LLMPayload, ROLE, Text, ToolResult
 from src.core.models.stream import ChatStream
 from .config import DefaultChatterConfig
 
@@ -306,14 +302,13 @@ class DefaultChatter(BaseChatter):
         Returns:
             dict: 包含 should_respond (bool) 和 reason (str)
         """
-        # 1. 获取模型配置
-        model_set = get_model_set_by_task("sub_actor")
-
-        if not model_set:
+        # 1. 创建子代理请求
+        try:
+            request = self.create_request("sub_actor", "sub_agent", max_context=5)
+        except (ValueError, KeyError):
             return {"should_respond": True, "reason": "未找到 sub_actor 配置，默认响应"}
 
-        # 2. 构建子代理请求
-        # 共享上下文：排除掉主代理的 SYSTEM 提示词，注入子代理的
+        # 2. 构建子代理上下文（排除主代理的 SYSTEM/TOOL 相关消息，防止子代理产生 tool call）
         sub_payloads = []
 
         # 注入子代理系统提示词
@@ -325,8 +320,6 @@ class DefaultChatter(BaseChatter):
             sub_prompt = sub_agent_system_prompt.format(nickname=nickname)
         sub_payloads.append(LLMPayload(ROLE.SYSTEM, Text(sub_prompt)))
 
-        # 过滤掉原有的 SYSTEM 和 TOOL 相关消息，子代理不需要工具定义
-        # 只保留对话历史 (USER/ASSISTANT)，防止子代理产生 tool call
         for p in payloads:
             if p.role not in (ROLE.SYSTEM, ROLE.TOOL, ROLE.TOOL_RESULT):
                 sub_payloads.append(p)
@@ -336,13 +329,6 @@ class DefaultChatter(BaseChatter):
             LLMPayload(ROLE.USER, Text(f"【新收到待判定消息】\n{unreads_text}"))
         )
 
-        context_manager = LLMContextManager(max_payloads=5)
-
-        request = create_llm_request(
-            model_set,
-            "sub_agent",
-            context_manager=context_manager,
-        )
         for p in sub_payloads:
             request.add_payload(p)
 
@@ -356,10 +342,7 @@ class DefaultChatter(BaseChatter):
                 logger.warning("Sub-agent 返回了空内容，默认进行响应")
                 return {"should_respond": True, "reason": "模型未返回判断内容"}
 
-            # 4. 解析 JSON
-            import json_repair
-
-            # 使用 json_repair.loads 直接尝试解析（它会自动处理 markdown 块和修复）
+            # 4. 解析 JSON（json_repair 自动处理 markdown 块和修复）
             try:
                 result = json_repair.loads(content)
 
@@ -411,27 +394,11 @@ class DefaultChatter(BaseChatter):
 
         # ── 构建 LLM 请求 ──
         try:
-            model_set = get_model_set_by_task("actor")
-            if model_set:
-                first_model = model_set[0]
-                logger.debug(
-                    f"模型配置: provider={first_model.get('api_provider')}, "
-                    f"base_url={first_model.get('base_url')}, "
-                    f"timeout={first_model.get('timeout')}"
-                )
-        except Exception as e:
+            request = self.create_request("actor")
+        except (ValueError, KeyError) as e:
             logger.error(f"获取模型配置失败: {e}")
             yield Failure(f"模型配置错误: {e}")
             return
-
-        context_manager = LLMContextManager(
-            max_payloads=get_core_config().chat.max_context_size
-        )
-        request = create_llm_request(
-            model_set,
-            "default_chatter",
-            context_manager=context_manager,
-        )
 
         # 系统提示（动态构建）
         system_prompt = self._build_system_prompt(chat_stream)
@@ -442,14 +409,8 @@ class DefaultChatter(BaseChatter):
         if history_text:
             request.add_payload(LLMPayload(ROLE.USER, Text(history_text)))
 
-        # ── 收集可用工具 ──
-        usables = await self.get_llm_usables()
-        usables = await self.modify_llm_usables(usables)
-
-        usable_map = create_tool_registry(usables)  # 将工具注册到工具注册表中
-
-        if usable_map.get_all():
-            request.add_payload(LLMPayload(ROLE.TOOL, usable_map.get_all()))  # type: ignore[arg-type]
+        # ── 注入可用工具 ──
+        usable_map = await self.inject_usables(request)
 
         # ── 对话循环 ──
         response = request
@@ -540,38 +501,9 @@ class DefaultChatter(BaseChatter):
                     should_stop = True
 
                 else:
-                    # 普通 action/tool：通过 exec_llm_usable 执行
-                    usable_cls = usable_map.get(call.name)
-                    if not usable_cls:
-                        result_text = f"未知的工具: {call.name}"
-                        logger.warning(result_text)
-                    else:
-                        try:
-                            # 使用最后一条未读消息作为触发消息；若为空跳过
-                            trigger_msg = unreads[-1] if unreads else None
-                            if trigger_msg is None:
-                                continue
-                            else:
-                                success, result = await self.exec_llm_usable(
-                                    usable_cls, trigger_msg, **args  # type: ignore[arg-type]
-                                )
-                                result_text = (
-                                    str(result) if success else f"执行失败: {result}"
-                                )
-                        except Exception as e:
-                            result_text = f"执行异常: {e}"
-                            logger.error(f"执行 {call.name} 异常: {e}", exc_info=True)
-
-                    response.add_payload(
-                        LLMPayload(
-                            ROLE.TOOL_RESULT,
-                            ToolResult(  # type: ignore[arg-type]
-                                value=result_text,
-                                call_id=call.id,
-                                name=call.name,
-                            ),
-                        )
-                    )
+                    # 普通 action/tool：通过 run_tool_call 执行
+                    trigger_msg = unreads[-1] if unreads else None
+                    await self.run_tool_call(call, response, usable_map, trigger_msg)
             # ── 处理控制流结果 ──
             if should_stop:
                 # 设置冷却时间
@@ -592,22 +524,15 @@ class DefaultChatter(BaseChatter):
     ) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
         """classical 模式执行流程。"""
         try:
-            model_set = get_model_set_by_task("actor")
-            if model_set:
-                first_model = model_set[0]
-                logger.debug(
-                    f"模型配置: provider={first_model.get('api_provider')}, "
-                    f"base_url={first_model.get('base_url')}, "
-                    f"timeout={first_model.get('timeout')}"
-                )
-        except Exception as e:
+            # classical 模式每轮独立构建请求，仅在此处获取一次工具注册表
+            _base_request = self.create_request("actor")
+        except (ValueError, KeyError) as e:
             logger.error(f"获取模型配置失败: {e}")
             yield Failure(f"模型配置错误: {e}")
             return
 
-        usables = await self.get_llm_usables()
-        usables = await self.modify_llm_usables(usables)
-        usable_map = create_tool_registry(usables)
+        # 在外层预先获取工具注册表（每轮复用）
+        usable_map = await self.inject_usables(_base_request)
 
         while True:
             formatted_text, unread_msgs = await self.fetch_unreads()
@@ -632,14 +557,7 @@ class DefaultChatter(BaseChatter):
                 yield Wait()
                 continue
 
-            context_manager = LLMContextManager(
-                max_payloads=get_core_config().chat.max_context_size
-            )
-            request = create_llm_request(
-                model_set,
-                "default_chatter",
-                context_manager=context_manager,
-            )
+            request = self.create_request("actor")
             request.add_payload(
                 LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(chat_stream)))
             )
@@ -706,39 +624,10 @@ class DefaultChatter(BaseChatter):
                         should_stop = True
 
                     else:
-                        usable_cls = usable_map.get(call.name)
-                        if not usable_cls:
-                            result_text = f"未知的工具: {call.name}"
-                            logger.warning(result_text)
-                        else:
-                            try:
-                                trigger_msg = unreads[-1] if unreads else None
-                                if trigger_msg is None:
-                                    continue
-                                success, result = await self.exec_llm_usable(
-                                    usable_cls, trigger_msg, **args  # type: ignore[arg-type]
-                                )
-                                result_text = (
-                                    str(result) if success else f"执行失败: {result}"
-                                )
-                                if success and call.name == _SEND_TEXT:
-                                    sent_once = True
-                            except Exception as e:
-                                result_text = f"执行异常: {e}"
-                                logger.error(
-                                    f"执行 {call.name} 异常: {e}", exc_info=True
-                                )
-
-                        response.add_payload(
-                            LLMPayload(
-                                ROLE.TOOL_RESULT,
-                                ToolResult(  # type: ignore[arg-type]
-                                    value=result_text,
-                                    call_id=call.id,
-                                    name=call.name,
-                                ),
-                            )
-                        )
+                        trigger_msg = unreads[-1] if unreads else None
+                        _, success = await self.run_tool_call(call, response, usable_map, trigger_msg)
+                        if success and call.name == _SEND_TEXT:
+                            sent_once = True
 
                 if sent_once:
                     logger.info("classical 模式已发送一次消息，强制结束当前对话")

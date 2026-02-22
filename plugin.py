@@ -242,7 +242,7 @@ class DefaultChatter(BaseChatter):
     ) -> str:
         """构建 classical 模式 user 提示词。"""
         history_lines = []
-        history_messages = getattr(chat_stream.context, "history_messages", [])
+        history_messages = chat_stream.context.history_messages
         for msg in history_messages:
             history_lines.append(
                 f"[{self._format_hms(getattr(msg, 'time', ''))}] "
@@ -262,6 +262,39 @@ class DefaultChatter(BaseChatter):
         unread_block = "\n".join(unread_lines) if unread_lines else "（无）"
 
         return f"# 历史消息\n{history_block}\n\n# 未读消息\n{unread_block}\n 注意历史消息只用来了解上下文，你的回复应该基于未读消息来生成，不要复述历史消息中的内容。"
+
+    def _build_enhanced_history_text(self, chat_stream: Any) -> str:
+        """构建 enhanced 模式的历史消息文本。"""
+        history_lines: list[str] = []
+        history_messages = chat_stream.context.history_messages
+
+        for msg in history_messages:
+            history_lines.append(
+                f"【{self._format_hms(getattr(msg, 'time', ''))}】"
+                f"{getattr(msg, 'sender_name', '未知发送者')}: "
+                f"{getattr(msg, 'processed_plain_text', '')}"
+            )
+
+        return "以下为最近的聊天历史记录：\n" + "\n".join(history_lines)
+
+    @staticmethod
+    def _upsert_pending_unread_payload(
+        response: Any,
+        formatted_text: str,
+    ) -> None:
+        """在未发送前合并未读消息到最后一个 USER payload。"""
+        if response.payloads:
+            last_payload = response.payloads[-1]
+            if last_payload.role == ROLE.USER:
+                if last_payload.content and isinstance(last_payload.content[-1], Text):
+                    existing_text = last_payload.content[-1].text
+                    separator = "\n" if existing_text else ""
+                    last_payload.content[-1] = Text(f"{existing_text}{separator}{formatted_text}")
+                else:
+                    last_payload.content.append(Text(formatted_text))
+                return
+
+        response.add_payload(LLMPayload(ROLE.USER, Text(formatted_text)))
 
     async def sub_agent(self, unreads_text: str, payloads: list[LLMPayload]) -> dict:
         """子代理决策：判断是否需要响应用新消息。
@@ -405,12 +438,7 @@ class DefaultChatter(BaseChatter):
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         # 历史消息（来自 stream context，构成对话背景）
-        history_lines = []
-        for msg in chat_stream.context.history_messages:  # type: ignore[union-attr]
-            history_lines.append(
-                f"【{msg.time}】{msg.sender_name}: {msg.processed_plain_text}"
-            )
-        history_text = "以下为最近的聊天历史记录：\n" + "\n".join(history_lines)
+        history_text = self._build_enhanced_history_text(chat_stream)
         if history_text:
             request.add_payload(LLMPayload(ROLE.USER, Text(history_text)))
 
@@ -439,8 +467,11 @@ class DefaultChatter(BaseChatter):
                     f"Sub-agent 决策: {decision['reason']} (响应: {decision['should_respond']})"
                 )
 
-                # 无论是否响应，都将消息作为 USER payload 追加到主上下文中
-                response.add_payload(LLMPayload(ROLE.USER, Text(formatted_text)))
+                # 无论是否响应，都将未读消息并入单个 USER payload
+                self._upsert_pending_unread_payload(
+                    response=response,
+                    formatted_text=formatted_text,
+                )
 
                 if not decision["should_respond"]:
                     logger.info("Sub-agent 决定不响应，继续等待...")

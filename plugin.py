@@ -63,6 +63,11 @@ system_prompt = """# 关于你
 - 后续的消息都遵循 json 的标准化格式。这个格式是给你看的，请不要模仿其格式与用户对话。
 - 你的回复必须有理有据，禁止无根据地编造信息或胡乱回复。如果你不确定如何回复，可以跟风或转移话题，但是前提是足够自然不机械。
 
+# 工具介绍
+- Action：action通常是你在对话中需要执行的动作，例如发送消息、结束对话等。你可以调用 action 来完成这些任务，调用时请务必按照规定的格式提供必要的信息。这类工具通常不会提供任何信息，因此如果当你调用action并收到返回结果后，你只需要输出"__SUSPEND__"表示挂起对话等待下一步指令即可。
+- Tool：tool通常是你在对话中需要查询信息或执行特定功能时调用的工具，例如查询天气、计算器等。你可以调用 tool 来获取这些信息或功能，调用时请务必按照规定的格式提供必要的信息。这类工具通常会返回一些结果信息，因此当你调用tool并收到返回结果后，你应该根据结果信息继续进行合理的回复或进一步执行其他工具，而不是简单地输出"__SUSPEND__"。
+- Agent：agent通常是你在对话中需要调用的智能体，例如执行复杂任务、处理多轮对话等。你可以调用 agent 来完成这些任务，调用时请务必按照规定的格式提供必要的信息。这类工具通常会返回一些结果信息，因此当你调用agent并收到返回结果后，你应该根据结果信息继续进行合理的回复或进一步执行其他工具。
+
 当前时间: {current_time}
 
 # 其他信息
@@ -151,10 +156,13 @@ class StopConversationAction(BaseAction):
 
 # ─── Chatter ────────────────────────────────────────────────
 
-# 控制流标记名称，用于 Chatter 识别特殊 action
-_PASS_AND_WAIT = "pass_and_wait"
-_STOP_CONVERSATION = "stop_conversation"
-_SEND_TEXT = "send_text"
+# 控制流标记名称，与 BaseAction.to_schema() 生成的 name 保持一致（含 action: 前缀）
+_PASS_AND_WAIT = "action:pass_and_wait"
+_STOP_CONVERSATION = "action:stop_conversation"
+_SEND_TEXT = "action:send_text"
+
+# SUSPEND 占位符：当 LLM 本轮全部调用的都是 action 时，注入此占位防止上下文缺少 assistant 轮次
+_SUSPEND_TEXT = "__SUSPEND__"
 
 
 class DefaultChatter(BaseChatter):
@@ -504,6 +512,18 @@ class DefaultChatter(BaseChatter):
                     # 普通 action/tool：通过 run_tool_call 执行
                     trigger_msg = unreads[-1] if unreads else None
                     await self.run_tool_call(call, response, usable_map, trigger_msg)
+
+            # ── 若本轮全部 call 均为 action 类型，注入 SUSPEND 占位符 ──
+            # action 执行后不需要 LLM 进一步响应结果，但为保持上下文规范
+            # (assistant tool_call → tool_result → assistant)，补充一个占位 assistant 消息。
+            if response.call_list and all(
+                c.name.startswith("action:") for c in response.call_list
+            ):
+                response.add_payload(
+                    LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                )
+                logger.debug("已注入 SUSPEND 占位符（本轮全部为 action 调用）")
+
             # ── 处理控制流结果 ──
             if should_stop:
                 # 设置冷却时间
@@ -634,6 +654,15 @@ class DefaultChatter(BaseChatter):
                         if success and call.name == _SEND_TEXT:
                             sent_once = True
                             break  # 已发送一次，立即停止处理同批次的后续 tool call
+
+                # ── 若本轮全部 call 均为 action 类型，注入 SUSPEND 占位符 ──
+                if response.call_list and all(
+                    c.name.startswith("action:") for c in response.call_list
+                ):
+                    response.add_payload(
+                        LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                    )
+                    logger.debug("已注入 SUSPEND 占位符（本轮全部为 action 调用）")
 
                 if sent_once:
                     logger.info("classical 模式已发送一次消息，强制结束当前对话")
